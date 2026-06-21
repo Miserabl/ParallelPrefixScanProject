@@ -18,12 +18,12 @@
 //   Grid(num_chunks, D_rt),  Block(CHUNK_SIZE)
 //   blockIdx.y = d  (runtime dimension index)
 // ---------------------------------------------------------------------------
-template <typename ScanImpl>
+template <typename ScanImpl, typename StorageT>
 __global__ void phase1_scan(
-    const float* __restrict__ a_in,
-    const float* __restrict__ b_in,
-          float* __restrict__ a_out,
-          float* __restrict__ b_out,
+    const StorageT* __restrict__ a_in,
+    const StorageT* __restrict__ b_in,
+          StorageT* __restrict__ a_out,
+          StorageT* __restrict__ b_out,
           float* __restrict__ tot_a,   // [D_rt * num_chunks]
           float* __restrict__ tot_b,
     int L, int num_chunks)
@@ -35,16 +35,16 @@ __global__ void phase1_scan(
     const int tid = threadIdx.x;
     const int t   = cid * CHUNK_SIZE + tid;
 
-    shmem[tid]              = (t < L) ? a_in[d * L + t] : 1.0f;
-    shmem[CHUNK_SIZE + tid] = (t < L) ? b_in[d * L + t] : 0.0f;
+    shmem[tid]              = (t < L) ? storage_to_float(a_in[d * L + t]) : 1.0f;
+    shmem[CHUNK_SIZE + tid] = (t < L) ? storage_to_float(b_in[d * L + t]) : 0.0f;
     __syncthreads();
 
     __shared__ float s_tot_a, s_tot_b;
     ScanImpl::block_scan(shmem, CHUNK_SIZE, &s_tot_a, &s_tot_b);
 
     if (t < L) {
-        a_out[d * L + t] = shmem[tid];
-        b_out[d * L + t] = shmem[CHUNK_SIZE + tid];
+        a_out[d * L + t] = float_to_storage<StorageT>(shmem[tid]);
+        b_out[d * L + t] = float_to_storage<StorageT>(shmem[CHUNK_SIZE + tid]);
     }
     if (tid == 0) {
         tot_a[d * num_chunks + cid] = s_tot_a;
@@ -84,9 +84,10 @@ __global__ void phase2_scan_totals(
 // Phase 3: propagate scanned totals into each chunk's elements.
 //   Grid(num_chunks, D_rt),  Block(CHUNK_SIZE)
 // ---------------------------------------------------------------------------
+template <typename StorageT>
 __global__ void phase3_propagate(
-          float* __restrict__ a_out,
-          float* __restrict__ b_out,
+          StorageT* __restrict__ a_out,
+          StorageT* __restrict__ b_out,
     const float* __restrict__ tot_a,
     const float* __restrict__ tot_b,
     int L, int num_chunks)
@@ -100,12 +101,12 @@ __global__ void phase3_propagate(
 
     float pa = tot_a[d * num_chunks + cid - 1];
     float pb = tot_b[d * num_chunks + cid - 1];
-    float xa = a_out[d * L + t];
-    float xb = b_out[d * L + t];
+    float xa = storage_to_float(a_out[d * L + t]);
+    float xb = storage_to_float(b_out[d * L + t]);
 
     // combine(left=(pa,pb), right=(xa,xb))
-    a_out[d * L + t] = xa * pa;
-    b_out[d * L + t] = xa * pb + xb;
+    a_out[d * L + t] = float_to_storage<StorageT>(xa * pa);
+    b_out[d * L + t] = float_to_storage<StorageT>(xa * pb + xb);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,10 +114,10 @@ __global__ void phase3_propagate(
 //   D_rt : runtime hidden-state dimension
 //   d_scratch : pre-allocated, >= 2 * D_rt * L floats
 // ---------------------------------------------------------------------------
-template <typename ScanImpl>
+template <typename ScanImpl, typename StorageT>
 void chunked_scan_impl(
-    float* d_a_in,  float* d_b_in,
-    float* d_a_out, float* d_b_out,
+    StorageT* d_a_in,  StorageT* d_b_in,
+    StorageT* d_a_out, StorageT* d_b_out,
     int L, int D_rt,
     float* d_scratch)
 {
@@ -129,7 +130,7 @@ void chunked_scan_impl(
     float* next_scratch = d_scratch + (size_t)D_rt * num_chunks * 2;
 
     dim3 grid1(num_chunks, D_rt);
-    phase1_scan<ScanImpl><<<grid1, CHUNK_SIZE, SHMEM_BYTES>>>(
+    phase1_scan<ScanImpl, StorageT><<<grid1, CHUNK_SIZE, SHMEM_BYTES>>>(
         d_a_in, d_b_in, d_a_out, d_b_out, tot_a, tot_b, L, num_chunks);
 
     if (num_chunks <= CHUNK_SIZE) {
@@ -140,14 +141,14 @@ void chunked_scan_impl(
         float* tmp_a        = next_scratch;
         float* tmp_b        = next_scratch + (size_t)D_rt * num_chunks;
         float* deep_scratch = next_scratch + (size_t)D_rt * num_chunks * 2;
-        chunked_scan_impl<ScanImpl>(
+        chunked_scan_impl<ScanImpl, float>(
             tot_a, tot_b, tmp_a, tmp_b, num_chunks, D_rt, deep_scratch);
         cudaMemcpy(tot_a, tmp_a, (size_t)D_rt * num_chunks * sizeof(float), cudaMemcpyDeviceToDevice);
         cudaMemcpy(tot_b, tmp_b, (size_t)D_rt * num_chunks * sizeof(float), cudaMemcpyDeviceToDevice);
     }
 
     dim3 grid3(num_chunks, D_rt);
-    phase3_propagate<<<grid3, CHUNK_SIZE>>>(
+    phase3_propagate<StorageT><<<grid3, CHUNK_SIZE>>>(
         d_a_out, d_b_out, tot_a, tot_b, L, num_chunks);
 }
 
@@ -161,24 +162,24 @@ void chunked_scan_impl(
 //     Caller provides scratch (>= 2 * D * L floats).  No allocation inside
 //     the timed region.
 // ---------------------------------------------------------------------------
-template <typename ScanImpl>
-void chunked_scan(float* d_a_in, float* d_b_in,
-                  float* d_a_out, float* d_b_out,
+template <typename ScanImpl, typename StorageT>
+void chunked_scan(StorageT* d_a_in, StorageT* d_b_in,
+                  StorageT* d_a_out, StorageT* d_b_out,
                   int L, int D_rt)
 {
     float* d_scratch;
     cudaMalloc(&d_scratch, 2ULL * D_rt * L * sizeof(float));
-    chunked_scan_impl<ScanImpl>(d_a_in, d_b_in, d_a_out, d_b_out, L, D_rt, d_scratch);
+    chunked_scan_impl<ScanImpl, StorageT>(d_a_in, d_b_in, d_a_out, d_b_out, L, D_rt, d_scratch);
     cudaFree(d_scratch);
 }
 
-template <typename ScanImpl>
-void chunked_scan(float* d_a_in, float* d_b_in,
-                  float* d_a_out, float* d_b_out,
+template <typename ScanImpl, typename StorageT>
+void chunked_scan(StorageT* d_a_in, StorageT* d_b_in,
+                  StorageT* d_a_out, StorageT* d_b_out,
                   int L, int D_rt,
                   float* d_scratch)
 {
-    chunked_scan_impl<ScanImpl>(d_a_in, d_b_in, d_a_out, d_b_out, L, D_rt, d_scratch);
+    chunked_scan_impl<ScanImpl, StorageT>(d_a_in, d_b_in, d_a_out, d_b_out, L, D_rt, d_scratch);
 }
 
 #endif // CHUNKED_HIERARCHICAL_RECURSIVE_CUH

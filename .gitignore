@@ -3,19 +3,28 @@ SyntheticData/inputs/
 
 # Reference outputs — run run_reference locally to recreate
 SequentialData/
+SequentialBaseline/SequentialData/
+RealInputs/
 
 # Compiled binaries
 *.o
 *.out
 generate_inputs
 run_reference
+Kernels/benchmark
+Kernels/profile_driver
+Benchmarking/benchmark
 
 # SLURM logs
 *.err
 
 # Nsight outputs
 nsight_outputs/
+*.ncu-rep
 
 ._*
 .DS_Store
 __pycache__/
+
+# Local project summary notes
+project.md

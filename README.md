@@ -1,5 +1,17 @@
 ## Setup
 
+### Python baseline dependency
+The optional `selective_scan_cuda` baseline is provided through the Python package
+`mamba-ssm`. Install it into an environment that already has CUDA-enabled
+PyTorch:
+
+```bash
+pip install -r requirements.txt --no-build-isolation
+```
+
+If `mamba-ssm` is absent, the Python baseline harness skips gracefully and the
+CUDA C++ benchmarks still run.
+
 ### 1. Generate synthetic inputs (run once)
 Inputs are not committed to the repo. Generate them locally:
 ```bash
@@ -26,9 +38,45 @@ This writes:
 ```bash
 cd Kernels
 nvcc -O3 -std=c++17 -arch=sm_80 -o benchmark benchmark.cu
-./benchmark ../SyntheticData/inputs ../SequentialBaseline/SequentialData ../Results
+./benchmark ../SyntheticData/inputs ../SequentialBaseline/SequentialData ../Results --dtype fp32 --warmup 10 --repeat 50
 ```
 Output CSV: `Results/benchmark.csv`
+
+Supported dtypes:
+- `fp32`
+- `bf16`
+- `fp16`
+
+Example BF16 sweep:
+```bash
+./benchmark ../SyntheticData/inputs ../SequentialBaseline/SequentialData ../Results --dtype bf16 --warmup 10 --repeat 50
+```
+
+The benchmark now reports:
+- `median_ms`
+- `p25_ms`
+- `p75_ms`
+- `iqr_ms`
+- `mean_ms`
+- `stddev_ms`
+- raw `samples_ms`
+
+`throughput_GB_s` is reported as a logical payload metric, not literal measured
+DRAM bandwidth.
+
+### 3b. Run the optional official `selective_scan_cuda` baseline
+```bash
+python3 Benchmarking/benchmark_selective_scan.py \
+  --input_dir SyntheticData/inputs \
+  --ref_dir SequentialBaseline/SequentialData \
+  --output_csv Results/benchmark.csv \
+  --dtype bf16 \
+  --warmup 10 \
+  --repeat 50
+```
+
+This appends `selective_scan_cuda` rows to the same timing CSV when
+`mamba-ssm` is installed.
 
 ### 4. Inspect binary files
 ```bash
@@ -79,6 +127,14 @@ sbatch profile_all_metrics.sh
 then runs the sequential baseline to produce references, then runs Nsight
 profiling for all `(kernel, D, L)` cases.
 
+The script now also:
+- captures environment metadata in `env.txt`
+- detects the active GPU compute capability and compiles with the matching `sm_XX`
+- sweeps `fp32` and `bf16` by default, with `fp16` available through `SCAN_DTYPES`
+- uses `warmup=10`, `repeat=50` for timing rows
+- optionally appends `selective_scan_cuda` timing rows if `mamba-ssm` is installed
+- supports best-effort GPU clock locking through `GPU_CLOCK_LOCK=<min,max>`
+
 The script compiles one runtime-D profile driver and runs all `(kernel, D, L)` combinations, collecting:
 - timing CSV (`timing.csv`)
 - raw Nsight CSV logs (`raw_ncu/*.csv`)
@@ -101,9 +157,48 @@ Generated analysis files include:
 - `crossover_summary.csv`
 - `analysis_report.txt`
 
+### One-command reproduction
+```bash
+./scripts/reproduce_artifact.sh
+```
+
+This script regenerates inputs, recomputes CPU references, captures environment
+metadata, runs the C++ benchmark sweep, and appends the optional Python
+`selective_scan_cuda` baseline.
+
+### Real Mamba activation dump
+```bash
+python3 Benchmarking/dump_mamba_activations.py \
+  --pretrained state-spaces/mamba-2.8b \
+  --dtype bf16
+```
+
+This captures the true selective-scan inputs from a chosen Mamba layer and also
+derives scalar surrogate `(a, b)` inputs for the custom CUDA kernels by selecting
+one state channel.
+
+### End-to-end Mamba layer benchmark
+```bash
+python3 Benchmarking/benchmark_mamba_layer.py \
+  --pretrained state-spaces/mamba-2.8b \
+  --dtype bf16
+```
+
+This times a full Mamba mixer layer, including discretization, scan, and output
+projection.
+
 ## Correctness Checking
 
 GPU output is compared against sequential references in float32 with tolerance `1e-3`.
+
+## Canonical Artifact Notes
+
+- A100 remains the canonical target for reproduced figures and tables.
+- The scripts are written to run on other CUDA GPUs by detecting compute
+  capability at runtime.
+- Raw timing CSVs should be committed for reproducibility.
+- Summarized Nsight outputs should be committed.
+- Raw `.ncu-rep` files should stay out of git.
 
 ## Key Files
 

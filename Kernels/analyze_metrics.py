@@ -11,6 +11,8 @@ KERNEL_ORDER = {
     "warp_shuffle": 0,
     "blelloch": 1,
     "hillis_steele": 2,
+    "cub": 3,
+    "selective_scan_cuda": 4,
 }
 
 
@@ -66,21 +68,36 @@ def parse_timing_csv(path):
                 l = int(row["L"])
             except (KeyError, ValueError):
                 continue
-            key = (kernel, d, l)
+            dtype = (row.get("dtype") or "fp32").strip() or "fp32"
+            key = (kernel, dtype, d, l)
             timing[key] = {
-                "time_ms": parse_float(row.get("time_ms")),
+                "time_ms": parse_float(row.get("median_ms")) or parse_float(row.get("time_ms")),
+                "median_ms": parse_float(row.get("median_ms")) or parse_float(row.get("time_ms")),
+                "p25_ms": parse_float(row.get("p25_ms")),
+                "p75_ms": parse_float(row.get("p75_ms")),
+                "iqr_ms": parse_float(row.get("iqr_ms")),
+                "mean_ms": parse_float(row.get("mean_ms")),
+                "stddev_ms": parse_float(row.get("stddev_ms")),
                 "correct": int(parse_float(row.get("correct")) or 0),
                 "throughput_GB_s": parse_float(row.get("throughput_GB_s")),
+                "throughput_metric": (row.get("throughput_metric") or "").strip() or None,
+                "warmup": int(parse_float(row.get("warmup")) or 0),
+                "repeat": int(parse_float(row.get("repeat")) or 0),
+                "dtype": dtype,
+                "samples_ms": (row.get("samples_ms") or "").strip() or None,
             }
     return timing
 
 
 def parse_ncu_filename(path):
     name = os.path.basename(path)
-    match = re.match(r"^(?P<kernel>.+)_D(?P<D>\d+)_L(?P<L>\d+)\.csv$", name)
+    match = re.match(r"^(?P<kernel>.+)_(?P<dtype>fp32|bf16|fp16)_D(?P<D>\d+)_L(?P<L>\d+)\.csv$", name)
     if not match:
-        return None
-    return match.group("kernel"), int(match.group("D")), int(match.group("L"))
+        match = re.match(r"^(?P<kernel>.+)_D(?P<D>\d+)_L(?P<L>\d+)\.csv$", name)
+        if not match:
+            return None
+        return match.group("kernel"), "fp32", int(match.group("D")), int(match.group("L"))
+    return match.group("kernel"), match.group("dtype"), int(match.group("D")), int(match.group("L"))
 
 
 def parse_ncu_raw_csv(path):
@@ -329,6 +346,9 @@ def block_scan_combine_count(kernel, n):
 
 
 def model_phase_metrics(kernel, d, l):
+    if kernel not in {"warp_shuffle", "blelloch", "hillis_steele"}:
+        return {}
+
     chunk = chunk_size_for_d(d)
     if l <= 0:
         return {}
@@ -359,6 +379,9 @@ def model_phase_metrics(kernel, d, l):
 
 def model_run_metrics(kernel, d, l):
     phases = model_phase_metrics(kernel, d, l)
+    if not phases:
+        return {}
+
     dram_bytes = 0.0
     flops = 0.0
     for phase_data in phases.values():
@@ -577,7 +600,7 @@ def aggregate_launches(launches):
     }
 
 
-def launch_to_metrics_rows(launches, kernel, d, l):
+def launch_to_metrics_rows(launches, kernel, dtype, d, l):
     if not launches:
         return []
 
@@ -645,6 +668,7 @@ def launch_to_metrics_rows(launches, kernel, d, l):
 
         rows.append({
             "kernel": kernel,
+            "dtype": dtype,
             "D": d,
             "L": l,
             "launch_id": launch.get("__launch_id__", "unknown"),
@@ -710,6 +734,7 @@ def group_mean(rows, key_fields, value_fields):
 
 def sort_key(row):
     return (
+        row.get("dtype") or "fp32",
         row["D"],
         row["L"],
         KERNEL_ORDER.get(row["kernel"], 999),
@@ -754,33 +779,45 @@ def main():
             parsed = parse_ncu_filename(full_path)
             if not parsed:
                 continue
-            kernel, d, l = parsed
+            kernel, dtype, d, l = parsed
             launches = parse_ncu_raw_csv(full_path)
-            key = (kernel, d, l)
+            key = (kernel, dtype, d, l)
             launches_by_key[key] = merge_launch_lists(launches_by_key.get(key, []), launches)
 
-    for (kernel, d, l), launches in launches_by_key.items():
-        ncu_data[(kernel, d, l)] = aggregate_launches(launches)
-        launch_metric_rows.extend(launch_to_metrics_rows(launches, kernel, d, l))
+    for (kernel, dtype, d, l), launches in launches_by_key.items():
+        ncu_data[(kernel, dtype, d, l)] = aggregate_launches(launches)
+        launch_metric_rows.extend(launch_to_metrics_rows(launches, kernel, dtype, d, l))
 
     all_keys = set(timing.keys()) | set(ncu_data.keys())
     rows = []
     ridge_ai = safe_div(args.peak_fp32_gflops, args.peak_bw_gbs)
 
-    for key in sorted(all_keys, key=lambda k: (k[1], k[2], KERNEL_ORDER.get(k[0], 999), k[0])):
-        kernel, d, l = key
+    for key in sorted(all_keys, key=lambda k: (k[1], k[2], k[3], KERNEL_ORDER.get(k[0], 999), k[0])):
+        kernel, dtype, d, l = key
         time_rec = timing.get(key, {})
         ncu_rec = ncu_data.get(key, {})
         model_rec = model_run_metrics(kernel, d, l)
 
         row = {
             "kernel": kernel,
+            "dtype": dtype,
             "D": d,
             "L": l,
             "chunk_size": chunk_size_for_d(d),
             "time_ms": time_rec.get("time_ms"),
+            "median_ms": time_rec.get("median_ms"),
+            "p25_ms": time_rec.get("p25_ms"),
+            "p75_ms": time_rec.get("p75_ms"),
+            "iqr_ms": time_rec.get("iqr_ms"),
+            "mean_ms": time_rec.get("mean_ms"),
+            "stddev_ms": time_rec.get("stddev_ms"),
             "correct": time_rec.get("correct"),
             "throughput_GB_s_timing": time_rec.get("throughput_GB_s"),
+            "throughput_metric": time_rec.get("throughput_metric"),
+            "warmup": time_rec.get("warmup"),
+            "repeat": time_rec.get("repeat"),
+            "dtype": time_rec.get("dtype"),
+            "samples_ms": time_rec.get("samples_ms"),
             "sm_util_pct": ncu_rec.get("sm_util_pct"),
             "dram_util_pct": ncu_rec.get("dram_util_pct"),
             "achieved_occupancy_pct": ncu_rec.get("achieved_occupancy_pct"),
@@ -857,6 +894,7 @@ def main():
     launch_metric_rows.sort(key=lambda r: (
         r["D"],
         r["L"],
+        r["dtype"],
         KERNEL_ORDER.get(r["kernel"], 999),
         r["phase"],
         str(r["launch_id"]),
@@ -868,6 +906,7 @@ def main():
         launch_metric_rows,
         [
             "kernel", "D", "L", "launch_id", "launch_kernel_name", "phase",
+            "dtype",
             "gpu_time_duration", "sm_util_pct", "dram_util_pct",
             "achieved_occupancy_pct", "warp_threads_per_inst", "dram_bytes", "flops",
             "dram_bytes_source", "flops_source",
@@ -878,7 +917,7 @@ def main():
 
     phase_acc = {}
     for row in launch_metric_rows:
-        key = (row["kernel"], row["D"], row["L"])
+        key = (row["kernel"], row["dtype"], row["D"], row["L"])
         if key not in phase_acc:
             phase_acc[key] = {
                 "phase1_time": 0.0,
@@ -910,10 +949,11 @@ def main():
                 phase_acc[key]["other_time"] += dur
 
     phase_rows = []
-    for (kernel, d, l), stats in sorted(phase_acc.items(), key=lambda x: (x[0][1], x[0][2], KERNEL_ORDER.get(x[0][0], 999))):
+    for (kernel, dtype, d, l), stats in sorted(phase_acc.items(), key=lambda x: (x[0][1], x[0][2], x[0][3], KERNEL_ORDER.get(x[0][0], 999))):
         total = stats["phase1_time"] + stats["phase2_time"] + stats["phase3_time"] + stats["other_time"]
         phase_rows.append({
             "kernel": kernel,
+            "dtype": dtype,
             "D": d,
             "L": l,
             "phase1_time": stats["phase1_time"],
@@ -936,7 +976,7 @@ def main():
         phase_breakdown_csv,
         phase_rows,
         [
-            "kernel", "D", "L",
+            "kernel", "dtype", "D", "L",
             "phase1_time", "phase2_time", "phase3_time", "other_time", "total_time",
             "phase1_pct", "phase2_pct", "phase3_pct", "other_pct",
             "phase1_launches", "phase2_launches", "phase3_launches", "other_launches",
@@ -945,7 +985,9 @@ def main():
 
     merged_csv = os.path.join(args.out_dir, "merged_metrics.csv")
     merged_fields = [
-        "kernel", "D", "L", "chunk_size", "time_ms", "correct", "throughput_GB_s_timing",
+        "kernel", "D", "L", "dtype", "chunk_size", "time_ms", "median_ms", "p25_ms", "p75_ms",
+        "iqr_ms", "mean_ms", "stddev_ms", "correct", "throughput_GB_s_timing", "throughput_metric",
+        "warmup", "repeat", "samples_ms",
         "sm_util_pct", "dram_util_pct", "achieved_occupancy_pct", "resident_warps_est",
         "warp_efficiency_pct", "registers_per_thread_peak", "shared_mem_per_block_peak_bytes",
         "block_size_peak", "dram_bytes", "dram_bytes_source", "flops", "flops_source",
@@ -957,7 +999,7 @@ def main():
 
     occ_summary = group_mean(
         rows,
-        key_fields=["kernel", "D"],
+        key_fields=["kernel", "dtype", "D"],
         value_fields=[
             "achieved_occupancy_pct",
             "resident_warps_est",
@@ -975,54 +1017,57 @@ def main():
         occ_summary_csv,
         occ_summary,
         [
-            "kernel", "D", "achieved_occupancy_pct", "resident_warps_est", "warp_efficiency_pct",
+            "kernel", "dtype", "D", "achieved_occupancy_pct", "resident_warps_est", "warp_efficiency_pct",
             "registers_per_thread_peak", "shared_mem_per_block_peak_bytes", "block_size_peak",
             "sm_util_pct", "dram_util_pct", "bandwidth_util_pct",
         ],
     )
 
     crossover_rows = []
+    dtypes = sorted({row["dtype"] for row in rows})
     ds = sorted({row["D"] for row in rows})
     ls = sorted({row["L"] for row in rows})
-    time_lookup = {(row["kernel"], row["D"], row["L"]): row["time_ms"] for row in rows}
+    time_lookup = {(row["kernel"], row["dtype"], row["D"], row["L"]): row["time_ms"] for row in rows}
 
-    for d in ds:
-        ratio_series = []
-        for l in ls:
-            hillis = time_lookup.get(("hillis_steele", d, l))
-            blelloch = time_lookup.get(("blelloch", d, l))
-            if hillis is None or blelloch in (None, 0.0):
-                continue
-            ratio_series.append((l, hillis / blelloch))
+    for dtype in dtypes:
+        for d in ds:
+            ratio_series = []
+            for l in ls:
+                hillis = time_lookup.get(("hillis_steele", dtype, d, l))
+                blelloch = time_lookup.get(("blelloch", dtype, d, l))
+                if hillis is None or blelloch in (None, 0.0):
+                    continue
+                ratio_series.append((l, hillis / blelloch))
 
-        crossing = None
-        for i in range(1, len(ratio_series)):
-            prev_l, prev_r = ratio_series[i - 1]
-            cur_l, cur_r = ratio_series[i]
-            if (prev_r - 1.0) == 0:
-                crossing = (prev_l, prev_l)
-                break
-            if (prev_r - 1.0) * (cur_r - 1.0) < 0:
-                crossing = (prev_l, cur_l)
-                break
+            crossing = None
+            for i in range(1, len(ratio_series)):
+                prev_l, prev_r = ratio_series[i - 1]
+                cur_l, cur_r = ratio_series[i]
+                if (prev_r - 1.0) == 0:
+                    crossing = (prev_l, prev_l)
+                    break
+                if (prev_r - 1.0) * (cur_r - 1.0) < 0:
+                    crossing = (prev_l, cur_l)
+                    break
 
-        if crossing:
-            note = f"crosses between L={crossing[0]} and L={crossing[1]}"
-        elif ratio_series and all(r > 1.0 for _, r in ratio_series):
-            note = "hillis_steele slower than blelloch for all tested L"
-        elif ratio_series and all(r < 1.0 for _, r in ratio_series):
-            note = "hillis_steele faster than blelloch for all tested L"
-        else:
-            note = "no crossover detected in tested range"
+            if crossing:
+                note = f"crosses between L={crossing[0]} and L={crossing[1]}"
+            elif ratio_series and all(r > 1.0 for _, r in ratio_series):
+                note = "hillis_steele slower than blelloch for all tested L"
+            elif ratio_series and all(r < 1.0 for _, r in ratio_series):
+                note = "hillis_steele faster than blelloch for all tested L"
+            else:
+                note = "no crossover detected in tested range"
 
-        crossover_rows.append({
-            "D": d,
-            "note": note,
-            "ratio_series": "; ".join(f"L={l}: {r:.4f}" for l, r in ratio_series),
-        })
+            crossover_rows.append({
+                "dtype": dtype,
+                "D": d,
+                "note": note,
+                "ratio_series": "; ".join(f"L={l}: {r:.4f}" for l, r in ratio_series),
+            })
 
     crossover_csv = os.path.join(args.out_dir, "crossover_summary.csv")
-    write_csv(crossover_csv, crossover_rows, ["D", "note", "ratio_series"])
+    write_csv(crossover_csv, crossover_rows, ["dtype", "D", "note", "ratio_series"])
 
     lines = []
 
@@ -1038,21 +1083,25 @@ def main():
     emit("")
 
     emit("=== PERFORMANCE TABLES (time_ms) ===")
-    for d in ds:
-        emit(f"D={d}")
-        emit("L,warp_shuffle,blelloch,hillis_steele")
-        for l in ls:
-            ws = time_lookup.get(("warp_shuffle", d, l))
-            bl = time_lookup.get(("blelloch", d, l))
-            hs = time_lookup.get(("hillis_steele", d, l))
-            emit(f"{l},{fmt(ws, 4)},{fmt(bl, 4)},{fmt(hs, 4)}")
-        emit("")
+    kernels_present = [
+        kernel for kernel, _ in sorted(KERNEL_ORDER.items(), key=lambda item: item[1])
+        if any(row["kernel"] == kernel for row in rows)
+    ]
+    for dtype in dtypes:
+        emit(f"dtype={dtype}")
+        for d in ds:
+            emit(f"D={d}")
+            emit(",".join(["L"] + kernels_present))
+            for l in ls:
+                values = [fmt(time_lookup.get((kernel, dtype, d, l)), 4) for kernel in kernels_present]
+                emit(",".join([str(l)] + values))
+            emit("")
 
     emit("=== ROOFLINE POINTS (all runs) ===")
-    emit("kernel,D,L,AI_flop_per_byte,GFLOP_s,DRAM_BW_GB_s,roofline_bound,roofline_eff_pct")
+    emit("kernel,dtype,D,L,AI_flop_per_byte,GFLOP_s,DRAM_BW_GB_s,roofline_bound,roofline_eff_pct")
     for row in rows:
         emit(
-            f"{row['kernel']},{row['D']},{row['L']},"
+            f"{row['kernel']},{row['dtype']},{row['D']},{row['L']},"
             f"{fmt(row['ai_flop_per_byte'], 6)},"
             f"{fmt(row['gflops'], 3)},"
             f"{fmt(row['dram_bw_gb_s'], 3)},"
@@ -1062,10 +1111,10 @@ def main():
     emit("")
 
     emit("=== FULL PER-RUN UTILIZATION TABLE ===")
-    emit("kernel,D,L,occ_pct,warp_eff_pct,sm_util_pct,dram_util_pct,bw_util_pct,resident_warps,regs_per_thread,block_size,shared_mem_B,l1_hit_pct,l2_hit_pct,utilization_bound")
+    emit("kernel,dtype,D,L,occ_pct,warp_eff_pct,sm_util_pct,dram_util_pct,bw_util_pct,resident_warps,regs_per_thread,block_size,shared_mem_B,l1_hit_pct,l2_hit_pct,utilization_bound")
     for row in rows:
         emit(
-            f"{row['kernel']},{row['D']},{row['L']},"
+            f"{row['kernel']},{row['dtype']},{row['D']},{row['L']},"
             f"{fmt(row['achieved_occupancy_pct'], 2)},"
             f"{fmt(row['warp_efficiency_pct'], 2)},"
             f"{fmt(row['sm_util_pct'], 2)},"
@@ -1082,10 +1131,10 @@ def main():
     emit("")
 
     emit("=== PHASE BREAKDOWN (gpu_time_duration shares) ===")
-    emit("kernel,D,L,phase1_time,phase2_time,phase3_time,other_time,total_time,phase1_pct,phase2_pct,phase3_pct,other_pct")
+    emit("kernel,dtype,D,L,phase1_time,phase2_time,phase3_time,other_time,total_time,phase1_pct,phase2_pct,phase3_pct,other_pct")
     for row in phase_rows:
         emit(
-            f"{row['kernel']},{row['D']},{row['L']},"
+            f"{row['kernel']},{row['dtype']},{row['D']},{row['L']},"
             f"{fmt(row['phase1_time'], 4)},"
             f"{fmt(row['phase2_time'], 4)},"
             f"{fmt(row['phase3_time'], 4)},"
@@ -1099,10 +1148,10 @@ def main():
     emit("")
 
     emit("=== OCCUPANCY/REGISTER SUMMARY (avg over L) ===")
-    emit("kernel,D,occ_pct_avg,resident_warps_avg,warp_eff_avg,regs_peak_avg,block_size_avg,shared_mem_B_avg,sm_util_avg,dram_util_avg,bw_util_avg")
+    emit("kernel,dtype,D,occ_pct_avg,resident_warps_avg,warp_eff_avg,regs_peak_avg,block_size_avg,shared_mem_B_avg,sm_util_avg,dram_util_avg,bw_util_avg")
     for item in occ_summary:
         emit(
-            f"{item['kernel']},{item['D']},"
+            f"{item['kernel']},{item['dtype']},{item['D']},"
             f"{fmt(item['achieved_occupancy_pct'], 2)},"
             f"{fmt(item['resident_warps_est'], 2)},"
             f"{fmt(item['warp_efficiency_pct'], 2)},"
@@ -1117,7 +1166,7 @@ def main():
 
     emit("=== CROSSOVER ANALYSIS (hillis_steele / blelloch) ===")
     for row in crossover_rows:
-        emit(f"D={row['D']}: {row['note']}")
+        emit(f"dtype={row['dtype']} D={row['D']}: {row['note']}")
         emit(f"  {row['ratio_series']}")
     emit("")
 
